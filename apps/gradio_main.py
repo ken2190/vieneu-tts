@@ -3,7 +3,7 @@ print("⏳ Đang khởi động VieNeu-TTS... Vui lòng chờ...")
 import soundfile as sf
 import tempfile
 import torch
-from vieneu import VieNeuTTS, FastVieNeuTTS
+from vieneu import VieNeuTTS, FastVieNeuTTS, VllmVieNeuTTS
 import os
 import sys
 import time
@@ -41,7 +41,7 @@ tts = None
 current_backbone = None
 current_codec = None
 model_loaded = False
-using_lmdeploy = False
+current_backend = "standard"  # "standard", "lmdeploy", or "vllm"
 
 # Normalizer (module-level singleton)
 _text_normalizer = VietnameseTTSNormalizer()
@@ -66,23 +66,28 @@ def get_available_devices() -> list[str]:
 
 def get_model_status_message() -> str:
     """Reconstruct status message from global state"""
-    global model_loaded, tts, using_lmdeploy, current_backbone, current_codec
+    global model_loaded, tts, current_backend, current_backbone, current_codec
     if not model_loaded or tts is None:
         return "⏳ Chưa tải model."
-    
+
     backbone_config = BACKBONE_CONFIGS.get(current_backbone, {})
     codec_config = CODEC_CONFIGS.get(current_codec, {})
-    
-    backend_name = "🚀 LMDeploy (Optimized)" if using_lmdeploy else "📦 Standard"
-    
+
+    backend_names = {
+        "lmdeploy": "🚀 LMDeploy (Optimized)",
+        "vllm": "🚀 vLLM (Optimized)",
+        "standard": "📦 Standard",
+    }
+    backend_name = backend_names.get(current_backend, "📦 Standard")
+
     # We don't track the exact device strings perfectly in global state, so we estimate
-    device_info = "GPU" if using_lmdeploy else "Auto"
+    device_info = "GPU" if current_backend in ("lmdeploy", "vllm") else "Auto"
     codec_device = "CPU" if "ONNX" in (current_codec or "") else ("GPU/MPS" if torch.cuda.is_available() or torch.backends.mps.is_available() else "CPU")
-    
+
     preencoded_note = "\n⚠️ Codec ONNX không hỗ trợ chức năng clone giọng nói." if codec_config.get('use_preencoded') else ""
-    
+
     opt_info = ""
-    if using_lmdeploy and hasattr(tts, 'get_optimization_stats'):
+    if current_backend in ("lmdeploy", "vllm") and hasattr(tts, 'get_optimization_stats'):
         stats = tts.get_optimization_stats()
         opt_info = (
             f"\n\n🔧 Tối ưu hóa:"
@@ -109,23 +114,32 @@ def restore_ui_state():
         gr.update(interactive=False)         # btn_stop
     )
 
-def should_use_lmdeploy(backbone_choice: str, device_choice: str) -> bool:
-    """Determine if we should use LMDeploy backend."""
-    # LMDeploy not supported on macOS
-    if sys.platform == "darwin":
-        return False
+def get_gpu_backend(backend_choice: str, backbone_choice: str, device_choice: str) -> str:
+    """Determine which GPU backend to use.
 
+    Returns: 'lmdeploy', 'vllm', or 'standard'
+    """
     if "gguf" in backbone_choice.lower():
-        return False
+        return "standard"
 
-    if device_choice == "Auto":
-        has_gpu = torch.cuda.is_available()
-    elif device_choice == "CUDA":
-        has_gpu = torch.cuda.is_available()
-    else:
-        has_gpu = False
+    if sys.platform == "darwin":
+        return "standard"
 
-    return has_gpu
+    has_gpu = torch.cuda.is_available() and device_choice in ("Auto", "CUDA")
+    if not has_gpu:
+        return "standard"
+
+    if backend_choice == "LMDeploy":
+        return "lmdeploy"
+    if backend_choice == "vLLM":
+        return "vllm"
+    if backend_choice == "Auto":
+        # Prefer LMDeploy on bf16-capable GPUs, vLLM otherwise
+        if torch.cuda.is_bf16_supported():
+            return "lmdeploy"
+        return "vllm"
+    # "Standard" explicitly selected
+    return "standard"
 
 @lru_cache(maxsize=32)
 def get_ref_text_cached(text_path: str) -> str:
@@ -142,12 +156,12 @@ def cleanup_gpu_memory():
         torch.mps.empty_cache()
     gc.collect()
 
-def load_model(backbone_choice: str, codec_choice: str, device_choice: str, 
-               force_lmdeploy: bool, custom_model_id: str = "", custom_base_model: str = "", 
+def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
+               backend_choice: str, custom_model_id: str = "", custom_base_model: str = "",
                custom_hf_token: str = ""):
     """Load model with optimizations and max batch size control"""
-    global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
-    lmdeploy_error_reason = None
+    global tts, current_backbone, current_codec, model_loaded, current_backend
+    gpu_backend_error_reason = None
     model_loaded = False # Ensure we don't try to use a half-loaded model
     
     yield (
@@ -210,82 +224,75 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             
         codec_config = CODEC_CONFIGS[codec_choice]
         
-        # Override LMDeploy if custom
+        # Determine GPU backend
         if custom_loading:
              if "gguf" in backbone_config['repo'].lower():
-                 # GGUF must use Standard backend (llama-cpp)
-                 use_lmdeploy = False
+                 backend = "standard"
              elif is_merged_lora:
-                 # LoRA can use LMDeploy if we merge first (checked logic below) or Standard
-                 use_lmdeploy = force_lmdeploy and should_use_lmdeploy(custom_base_model, device_choice)
+                 backend = get_gpu_backend(backend_choice, custom_base_model, device_choice)
              else:
-                 # Full custom model (e.g. finetune)
-                 use_lmdeploy = force_lmdeploy and should_use_lmdeploy("VieNeu-TTS (GPU)", device_choice) # Assume GPU compatible?
+                 backend = get_gpu_backend(backend_choice, "VieNeu-TTS (GPU)", device_choice)
         else:
-             use_lmdeploy = force_lmdeploy and should_use_lmdeploy(backbone_choice, device_choice)
+             backend = get_gpu_backend(backend_choice, backbone_choice, device_choice)
         
-        if use_lmdeploy:
-            lmdeploy_error_reason = None
-            print(f"🚀 Using LMDeploy backend with optimizations")
-            
+        if backend in ("lmdeploy", "vllm"):
+            gpu_backend_error_reason = None
+            backend_label = "LMDeploy" if backend == "lmdeploy" else "vLLM"
+            print(f"🚀 Using {backend_label} backend with optimizations")
+
             backbone_device = "cuda"
-            
+
             if "ONNX" in codec_choice:
                 codec_device = "cpu"
             else:
                 codec_device = "cuda" if torch.cuda.is_available() else "cpu"
-            
-            # Special handling for Custom LoRA + LMDeploy -> Merge & Save
+
+            # Special handling for Custom LoRA + GPU backend -> Merge & Save
             target_backbone_repo = backbone_config["repo"]
-            
+
             if custom_loading and is_merged_lora:
                 safe_name = custom_model_id.strip().replace("/", "_").replace("\\", "_").replace(":", "")
                 cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "merged_models_cache", safe_name)
                 target_backbone_repo = os.path.abspath(cache_dir)
-                
+
                 # Check if already merged (and voices.json exists)
                 if not os.path.exists(cache_dir) or not os.path.exists(os.path.join(cache_dir, "vocab.json")):
-                    print(f"🔄 Merging LoRA for LMDeploy optimization: {cache_dir}")
+                    print(f"🔄 Merging LoRA for {backend_label} optimization: {cache_dir}")
                     if os.path.exists(cache_dir):
                         print("   ⚠️ Detected incomplete cache, rebuilding...")
                     yield (
-                         f"⏳ Đang merge và lưu model LoRA để tối ưu cho LMDeploy (thao tác này chỉ chạy một lần)...",
+                         f"⏳ Đang merge và lưu model LoRA để tối ưu cho {backend_label} (thao tác này chỉ chạy một lần)...",
                          gr.update(interactive=False),
                          gr.update(interactive=False),
                          gr.update(interactive=False),
                          gr.update(),
                          gr.update(), gr.update(), gr.update(), gr.update()
                     )
-                    
+
                     try:
-                        # Use GPU for merging if available for speed
-                        # We use the Base Model specified
                         base_repo = BACKBONE_CONFIGS[custom_base_model]["repo"]
                         merge_device = "cuda" if torch.cuda.is_available() else "cpu"
-                        
+
                         print(f"   • Loading base: {base_repo} ({merge_device})")
                         temp_tts = VieNeuTTS(
                             backbone_repo=base_repo,
-                            backbone_device=merge_device, 
+                            backbone_device=merge_device,
                             codec_repo=codec_config["repo"],
-                            codec_device="cpu", # Codec unused for merging, keep on CPU
+                            codec_device="cpu",
                             hf_token=custom_hf_token
                         )
-                        
+
                         print(f"   • Loading Adapter: {custom_model_id}")
                         temp_tts.load_lora_adapter(custom_model_id.strip(), hf_token=custom_hf_token)
-                        
+
                         print(f"   • Merging...")
                         if hasattr(temp_tts.backbone, "merge_and_unload"):
                             temp_tts.backbone = temp_tts.backbone.merge_and_unload()
-                        
+
                         print(f"   • Saving to cache: {cache_dir}")
                         temp_tts.backbone.save_pretrained(cache_dir)
                         temp_tts.tokenizer.save_pretrained(cache_dir)
-                        
-                        # Fix for LMDeploy: Explicitly save legacy tokenizer files (vocab.json, merges.txt)
-                        # because LMDeploy/Transformers might default to slow tokenizer if fast one has issues,
-                        # and save_pretrained on fast tokenizer sometimes omits legacy files.
+
                         try:
                             print("   • Ensuring legacy tokenizer files...")
                             from transformers import AutoTokenizer
@@ -294,7 +301,6 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                         except Exception as e:
                             print(f"   ⚠️ Warning: Could not save slow tokenizer files: {e}")
 
-                        # Save voices.json to cache directory so FastVieNeuTTS can find it
                         print(f"   • Saving voices definition...")
                         import json
                         voices_json_path = os.path.join(cache_dir, "voices.json")
@@ -309,46 +315,58 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                         del temp_tts
                         cleanup_gpu_memory()
                         print("   ✅ Merge & Save successfully!")
-                        
+
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
-                        raise RuntimeError(f"Failed to merge & save LoRA for LMDeploy: {e}")
+                        raise RuntimeError(f"Failed to merge & save LoRA for {backend_label}: {e}")
 
-            print(f"📦 Loading optimized model...")
+            print(f"📦 Loading optimized model ({backend_label})...")
             print(f"   Backbone: {target_backbone_repo} on {backbone_device}")
             print(f"   Codec: {codec_config['repo']} on {codec_device}")
             print(f"   Triton: Enabled")
-            
+
             try:
-                tts = FastVieNeuTTS(
-                    backbone_repo=target_backbone_repo,
-                    backbone_device=backbone_device,
-                    codec_repo=codec_config["repo"],
-                    codec_device=codec_device,
-                    memory_util=0.3,
-                    tp=1,
-                    enable_prefix_caching=True,
-                    enable_triton=True,
-                    hf_token=custom_hf_token
-                )
-                using_lmdeploy = True
-                
-                # Legacy caching removed
-                print(f"   ✅ Optimized backend initialized")
-                
+                if backend == "vllm":
+                    tts = VllmVieNeuTTS(
+                        backbone_repo=target_backbone_repo,
+                        backbone_device=backbone_device,
+                        codec_repo=codec_config["repo"],
+                        codec_device=codec_device,
+                        gpu_memory_utilization=0.3,
+                        tp=1,
+                        enable_prefix_caching=True,
+                        enable_triton=True,
+                        hf_token=custom_hf_token
+                    )
+                else:
+                    tts = FastVieNeuTTS(
+                        backbone_repo=target_backbone_repo,
+                        backbone_device=backbone_device,
+                        codec_repo=codec_config["repo"],
+                        codec_device=codec_device,
+                        memory_util=0.3,
+                        tp=1,
+                        enable_prefix_caching=True,
+                        enable_triton=True,
+                        hf_token=custom_hf_token
+                    )
+                current_backend = backend
+
+                print(f"   ✅ {backend_label} backend initialized")
+
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                
+
                 error_str = str(e)
                 if "$env:CUDA_PATH" in error_str:
-                    lmdeploy_error_reason = "Không tìm thấy biến môi trường CUDA_PATH. Vui lòng cài đặt NVIDIA GPU Computing Toolkit."
+                    gpu_backend_error_reason = "Không tìm thấy biến môi trường CUDA_PATH. Vui lòng cài đặt NVIDIA GPU Computing Toolkit."
                 else:
-                    lmdeploy_error_reason = f"{error_str}"
-                
+                    gpu_backend_error_reason = f"{error_str}"
+
                 yield (
-                    f"⚠️ LMDeploy Init Error: {lmdeploy_error_reason}. Đang loading model với backend mặc định - tốc độ chậm hơn so với lmdeploy...",
+                    f"⚠️ {backend_label} Init Error: {gpu_backend_error_reason}. Đang loading model với backend mặc định - tốc độ chậm hơn...",
                     gr.update(interactive=False),
                     gr.update(interactive=False),
                     gr.update(interactive=False),
@@ -356,27 +374,24 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                     gr.update(), gr.update(), gr.update(), gr.update()
                 )
                 time.sleep(1)
-                use_lmdeploy = False
-                using_lmdeploy = False
-        
-        if not use_lmdeploy:
+                backend = "standard"
+                current_backend = "standard"
+
+        if backend == "standard":
             print(f"📦 Using original backend")
 
             if device_choice == "Auto":
                 if "gguf" in backbone_config['repo'].lower():
-                    # GGUF: uses Metal on Mac, CUDA on Windows/Linux
                     if sys.platform == "darwin":
-                        backbone_device = "gpu"  # llama-cpp-python uses Metal
+                        backbone_device = "gpu"
                     else:
                         backbone_device = "gpu" if torch.cuda.is_available() else "cpu"
                 else:
-                    # PyTorch model
                     if sys.platform == "darwin":
                         backbone_device = "mps" if torch.backends.mps.is_available() else "cpu"
                     else:
                         backbone_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-                # Codec device
                 if "ONNX" in codec_choice:
                     codec_device = "cpu"
                 elif sys.platform == "darwin":
@@ -397,11 +412,11 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
 
             if "gguf" in backbone_config['repo'].lower() and backbone_device == "cuda":
                 backbone_device = "gpu"
-            
+
             print(f"📦 Loading model...")
             print(f"   Backbone: {backbone_config['repo']} on {backbone_device}")
             print(f"   Codec: {codec_config['repo']} on {codec_device}")
-            
+
             tts = VieNeuTTS(
                 backbone_repo=backbone_config["repo"],
                 backbone_device=backbone_device,
@@ -411,62 +426,43 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             )
 
             # Perform LoRA Merge if needed (ONLY for Standard Backend)
-            # For LMDeploy, we handled it above by saving to disk
-            if is_merged_lora and custom_loading and not using_lmdeploy:
+            if is_merged_lora and custom_loading and current_backend == "standard":
                 yield (
                     f"🔄 Đang tải và merge LoRA adapter: {custom_model_id}...",
                     gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(),
                     gr.update(), gr.update(), gr.update(), gr.update()
                 )
                 try:
-                    # 1. Load Adapter
                     tts.load_lora_adapter(custom_model_id.strip(), hf_token=custom_hf_token)
-                    
-                    # 2. Merge and Unload
-                    # Check if backbone matches expected type for merge
+
                     if hasattr(tts, 'backbone') and hasattr(tts.backbone, 'merge_and_unload'):
                         print("   🔄 Merging LoRA into backbone...")
                         tts.backbone = tts.backbone.merge_and_unload()
-                        
-                        # Reset LoRA state so it behaves like a normal model
-                        tts._lora_loaded = False 
+
+                        tts._lora_loaded = False
                         tts._current_lora_repo = None
                         print("   ✅ Merged successfully!")
                     else:
                         print("   ⚠️ Warning: Model does not support merge_and_unload, keeping adapter active.")
-                        
+
                 except Exception as e:
                      raise RuntimeError(f"Failed to merge LoRA: {e}")
 
-            using_lmdeploy = False
+            current_backend = "standard"
         
         current_backbone = backbone_choice
         current_codec = codec_choice
         model_loaded = True
         
         # Success message with optimization info
-        backend_name = "🚀 LMDeploy (Optimized)" if using_lmdeploy else "📦 Standard"
-        device_info = "cuda" if use_lmdeploy else (backbone_device if not use_lmdeploy else "N/A")
-        
         streaming_support = "✅ Có" if backbone_config['supports_streaming'] else "❌ Không"
         preencoded_note = "\n⚠️ Codec này cần sử dụng pre-encoded codes (.pt files)" if codec_config['use_preencoded'] else ""
-        
-        opt_info = ""
-        if using_lmdeploy and hasattr(tts, 'get_optimization_stats'):
-            stats = tts.get_optimization_stats()
-            opt_info = (
-                f"\n\n🔧 Tối ưu hóa:"
-                f"\n  • Triton: {'✅' if stats['triton_enabled'] else '❌'}"
-                f"\n  • Max Batch Size (Default): {stats.get('max_batch_size', 'N/A')}"
-                f"\n  • Reference Cache: {stats['cached_references']} voices"
-                f"\n  • Prefix Caching: ✅"
-            )
-        
+
         warning_msg = ""
-        if lmdeploy_error_reason:
+        if gpu_backend_error_reason:
              warning_msg = (
-                 f"\n\n⚠️ **Cảnh báo:** Không thể kích hoạt LMDeploy (Optimized Backend) do lỗi sau:\n"
-                 f"👉 {lmdeploy_error_reason}\n"
+                 f"\n\n⚠️ **Cảnh báo:** Không thể kích hoạt GPU Backend do lỗi sau:\n"
+                 f"👉 {gpu_backend_error_reason}\n"
                  f"💡 Hệ thống đã tự động chuyển về chế độ Standard (chậm hơn)."
              )
 
@@ -538,7 +534,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
         import traceback
         traceback.print_exc()
         model_loaded = False
-        using_lmdeploy = False
+        current_backend = "standard"
 
         if "$env:CUDA_PATH" in str(e):
             yield (
@@ -566,7 +562,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                       mode_tab: str, generation_mode: str, use_batch: bool, max_batch_size_run: int,
                       temperature: float, max_chars_chunk: int):
     """Synthesis with optimization support and max batch size control"""
-    global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
+    global tts, current_backbone, current_codec, model_loaded, current_backend
     
     if not model_loaded or tts is None:
         yield None, "⚠️ Vui lòng tải model trước!"
@@ -623,17 +619,17 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
     
     # === STANDARD MODE ===
     if generation_mode == "Standard (Một lần)":
-        backend_name = "LMDeploy" if using_lmdeploy else "Standard"
+        backend_name = {"lmdeploy": "LMDeploy", "vllm": "vLLM"}.get(current_backend, "Standard")
 
         normalized_text = _text_normalizer.normalize(raw_text)
         text_chunks = split_text_into_chunks(normalized_text, max_chars=max_chars_chunk)
         total_chunks = len(text_chunks)
 
-        batch_info = " (Batch Mode)" if use_batch and using_lmdeploy and total_chunks > 1 else ""
+        batch_info = " (Batch Mode)" if use_batch and current_backend in ("lmdeploy", "vllm") and total_chunks > 1 else ""
         
         # Show batch size info
         batch_size_info = ""
-        if use_batch and using_lmdeploy and hasattr(tts, 'max_batch_size'):
+        if use_batch and current_backend in ("lmdeploy", "vllm") and hasattr(tts, 'max_batch_size'):
             batch_size_info = f" [Max batch: {tts.max_batch_size}]"
         
         yield None, f"🚀 Bắt đầu tổng hợp {backend_name}{batch_info}{batch_size_info} ({total_chunks} đoạn)..."
@@ -645,7 +641,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
         
         try:
             # Use batch processing if enabled and using LMDeploy
-            if use_batch and using_lmdeploy and hasattr(tts, 'infer_batch') and total_chunks > 1:
+            if use_batch and current_backend in ("lmdeploy", "vllm") and hasattr(tts, 'infer_batch') and total_chunks > 1:
                 # Show how many mini-batches will be processed
                 num_batches = (total_chunks + max_batch_size_run - 1) // max_batch_size_run
                 
@@ -696,14 +692,15 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                 output_path = tmp.name
             
             process_time = time.time() - start_time
-            backend_info = f" (Backend: {'LMDeploy 🚀' if using_lmdeploy else 'Standard 📦'})"
+            _bn = {"lmdeploy": "LMDeploy 🚀", "vllm": "vLLM 🚀"}.get(current_backend, "Standard 📦")
+            backend_info = f" (Backend: {_bn})"
             speed_info = f", Tốc độ: {len(final_wav)/sr/process_time:.2f}x realtime" if process_time > 0 else ""
             
             
             yield output_path, f"✅ Hoàn tất! (Thời gian: {process_time:.2f}s{speed_info}){backend_info}"
             
             # Cleanup memory
-            if using_lmdeploy and hasattr(tts, 'cleanup_memory'):
+            if current_backend in ("lmdeploy", "vllm") and hasattr(tts, 'cleanup_memory'):
                 tts.cleanup_memory()
             
             cleanup_gpu_memory()
@@ -816,7 +813,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                 break
         
         full_audio_buffer = []
-        backend_info = "🚀 LMDeploy" if using_lmdeploy else "📦 Standard"
+        backend_info = {"lmdeploy": "🚀 LMDeploy", "vllm": "🚀 vLLM"}.get(current_backend, "📦 Standard")
         for sr, audio_data in pre_buffer:
             full_audio_buffer.append(audio_data)
             yield (sr, audio_data), f"🔊 Đang phát ({backend_info})..."
@@ -845,7 +842,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                 yield tmp.name, f"✅ Hoàn tất Streaming! ({backend_info})"
             
             # Cleanup memory
-            if using_lmdeploy and hasattr(tts, 'cleanup_memory'):
+            if current_backend in ("lmdeploy", "vllm") and hasattr(tts, 'cleanup_memory'):
                 tts.cleanup_memory()
             
             cleanup_gpu_memory()
@@ -1054,10 +1051,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 )
             
             with gr.Row():
-                use_lmdeploy_cb = gr.Checkbox(
-                    value=True, 
-                    label="🚀 Optimize with LMDeploy (Khuyên dùng cho NVIDIA GPU)",
-                    info="Tick nếu bạn dùng GPU để tăng tốc độ tổng hợp đáng kể."
+                backend_select = gr.Radio(
+                    ["Auto", "LMDeploy", "vLLM", "Standard"],
+                    value="Auto",
+                    label="🚀 GPU Backend",
+                    info="Auto: LMDeploy nếu GPU hỗ trợ bf16, vLLM cho GPU cũ (V100/T4/RTX 20). Standard: không dùng GPU backend."
                 )
             
             
@@ -1081,7 +1079,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         <strong>🐆 Hệ máy GPU</strong>
                         <div class="warning-banner-content">
                             Chọn <b>VieNeu-TTS-0.3B (GPU)</b> để x2 tốc độ (độ chính xác ~95% bản gốc).<br><br>
-                            ⚠️ <b>Lưu ý GPU cũ (RTX 10/20, T4):</b> Các GPU này không hỗ trợ bfloat16, nên khi dùng LMDeploy <b>bắt buộc</b> phải chọn <b>VieNeu-TTS-0.3B</b> thay vì bản VieNeu-TTS gốc.
+                            💡 <b>GPU cũ (RTX 10/20, T4, V100):</b> Chọn Backend <b>"Auto"</b> hoặc <b>"vLLM"</b> — hệ thống sẽ tự dùng float16 thay vì bfloat16.
                         </div>
                     </div>
                 </div>
@@ -1133,7 +1131,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     use_batch = gr.Checkbox(
                         value=True, 
                         label="⚡ Batch Processing",
-                        info="Xử lý nhiều đoạn cùng lúc (chỉ áp dụng khi sử dụng GPU và đã cài đặt LMDeploy)"
+                        info="Xử lý nhiều đoạn cùng lúc (chỉ áp dụng khi sử dụng GPU backend: LMDeploy hoặc vLLM)"
                     )
                     max_batch_size_run = gr.Slider(
                         minimum=1, 
@@ -1259,7 +1257,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
 
         btn_load.click(
             fn=load_model,
-            inputs=[backbone_select, codec_select, device_choice, use_lmdeploy_cb,
+            inputs=[backbone_select, codec_select, device_choice, backend_select,
                     custom_backbone_model_id, custom_backbone_base_model, custom_backbone_hf_token],
             outputs=[model_status, btn_generate, btn_load, btn_stop, voice_select, tab_preset, tab_custom, tabs, current_mode_state]
         )

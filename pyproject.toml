@@ -96,6 +96,7 @@ gpu = [
     "transformers; sys_platform == 'darwin'",
     "accelerate; sys_platform == 'darwin'",
 ]
+vllm = ["vllm; sys_platform != 'darwin'"]
 
 [dependency-groups]
 dev = [
@@ -109,6 +110,7 @@ gpu = [
     "transformers; sys_platform == 'darwin'",
     "accelerate; sys_platform == 'darwin'",
 ]
+vllm = ["vllm; sys_platform != 'darwin'"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
