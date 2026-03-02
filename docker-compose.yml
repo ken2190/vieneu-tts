@@ -1,0 +1,51 @@
+x-gpu-common: &gpu-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.gpu
+    target: dev
+  volumes:
+    # Mount source code for hot-reload — preserves /opt/venv from build
+    - ./src:/workspace/src
+    - ./apps:/workspace/apps
+    - ./tests:/workspace/tests
+    - ./config.yaml:/workspace/config.yaml
+    # Persist caches across rebuilds
+    - ${MODELS_DIR:-./models}:/root/.cache/huggingface
+    - uv_cache:/root/.cache/uv
+    - pip_cache:/root/.cache/pip
+    # Persist output
+    - ./output_audio:/workspace/output_audio
+  env_file:
+    - .env
+  stdin_open: true
+  tty: true
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  gpu:
+    <<: *gpu-common
+    container_name: vieneu-tts-gpu-dev
+    environment:
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=${PORT:-7860}
+      - GRADIO_SHARE=${GRADIO_SHARE:-0}
+    ports:
+      - "${PORT:-7860}:${PORT:-7860}"
+    command: ["uv", "run", "apps/gradio_main.py"]
+
+  serve:
+    <<: *gpu-common
+    container_name: vieneu-tts-serve-dev
+    ports:
+      - "${SERVE_PORT:-23333}:23333"
+    command: ["uv", "run", "python", "src/vieneu/serve.py", "--model", "${SERVE_MODEL:-pnnbao-ump/VieNeu-TTS}"]
+
+volumes:
+  uv_cache:
+  pip_cache:

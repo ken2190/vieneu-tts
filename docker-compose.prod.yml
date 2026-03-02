@@ -1,0 +1,35 @@
+x-gpu-common: &gpu-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.gpu
+    target: prod
+  image: ${IMAGE_NAME:-vieneu-tts}:${IMAGE_TAG:-latest}
+  restart: unless-stopped
+  volumes:
+    - ${MODELS_DIR:-./models}:/root/.cache/huggingface
+    - ./output_audio:/workspace/output_audio
+  env_file:
+    - .env
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  gpu:
+    <<: *gpu-common
+    container_name: vieneu-tts-gpu
+    environment:
+      - GRADIO_SHARE=${GRADIO_SHARE:-0}
+    ports:
+      - "${PORT:-7860}:7860"
+
+  serve:
+    <<: *gpu-common
+    container_name: vieneu-tts-serve
+    ports:
+      - "${SERVE_PORT:-23333}:23333"
+    command: ["uv", "run", "python", "src/vieneu/serve.py", "--model", "${SERVE_MODEL:-pnnbao-ump/VieNeu-TTS}"]
