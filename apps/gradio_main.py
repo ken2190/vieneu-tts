@@ -114,6 +114,11 @@ def restore_ui_state():
         gr.update(interactive=False)         # btn_stop
     )
 
+def _is_package_available(name: str) -> bool:
+    """Check if a Python package is importable."""
+    import importlib.util
+    return importlib.util.find_spec(name) is not None
+
 def get_gpu_backend(backend_choice: str, backbone_choice: str, device_choice: str) -> str:
     """Determine which GPU backend to use.
 
@@ -134,10 +139,22 @@ def get_gpu_backend(backend_choice: str, backbone_choice: str, device_choice: st
     if backend_choice == "vLLM":
         return "vllm"
     if backend_choice == "Auto":
-        # Prefer LMDeploy on bf16-capable GPUs, vLLM otherwise
+        has_lmdeploy = _is_package_available("lmdeploy")
+        has_vllm = _is_package_available("vllm")
+
         if torch.cuda.is_bf16_supported():
-            return "lmdeploy"
-        return "vllm"
+            # Prefer LMDeploy on bf16-capable GPUs
+            if has_lmdeploy:
+                return "lmdeploy"
+            if has_vllm:
+                return "vllm"
+        else:
+            # Prefer vLLM on non-bf16 GPUs (float16 auto-detection)
+            if has_vllm:
+                return "vllm"
+            if has_lmdeploy:
+                return "lmdeploy"
+        return "standard"
     # "Standard" explicitly selected
     return "standard"
 
