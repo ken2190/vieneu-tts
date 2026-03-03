@@ -5,6 +5,8 @@ import glob
 import re
 import logging
 import functools
+import sqlite3
+import threading
 from phonemizer import phonemize
 from phonemizer.backend.espeak.espeak import EspeakWrapper
 from vieneu_utils.normalize_text import VietnameseTTSNormalizer
@@ -15,20 +17,40 @@ DICT_DIR = os.getenv(
     os.path.join(os.path.dirname(__file__), "phone_dict")
 )
 
-MERGED_DICT_PATH = os.path.join(DICT_DIR, "phone_dict_merged.json")
-COMMON_DICT_PATH = os.path.join(DICT_DIR, "phone_dict_common.json")
+DB_PATH = os.path.join(DICT_DIR, "phone_dict.db")
 
 # Configure logging
 logger = logging.getLogger("Vieneu.Phonemizer")
 
-def load_json(path: str) -> dict:
-    """Load JSON file safely."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.warning(f"Warning: Dictionary not found at {path}")
-        return {}
+class PhonemeDB:
+    """SQLite-based dictionary for fast lookup and low memory usage."""
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._local = threading.local()
+
+    def _get_conn(self):
+        if not hasattr(self._local, "conn"):
+            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        return self._local.conn
+
+    def lookup_batch(self, words: list[str]) -> tuple[dict, dict]:
+        """Fetch multiple words from DB in two logical groups: merged and common."""
+        if not words: return {}, {}
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        
+        # Batch query for efficiency
+        placeholders = ','.join(['?'] * len(words))
+        
+        # Query merged table
+        cursor.execute(f"SELECT word, phone FROM merged WHERE word IN ({placeholders})", words)
+        merged_map = dict(cursor.fetchall())
+        
+        # Query common table
+        cursor.execute(f"SELECT word, vi_phone, en_phone FROM common WHERE word IN ({placeholders})", words)
+        common_map = {row[0]: {"vi": row[1], "en": row[2]} for row in cursor.fetchall()}
+        
+        return merged_map, common_map
 
 def setup_espeak_library() -> None:
     """Configure eSpeak library path based on operating system."""
@@ -90,8 +112,7 @@ def _setup_macos_espeak() -> None:
 
 # Initialize
 setup_espeak_library()
-phone_dict_merged = load_json(MERGED_DICT_PATH)
-phone_dict_common = load_json(COMMON_DICT_PATH)
+phone_db = PhonemeDB(DB_PATH)
 normalizer = VietnameseTTSNormalizer()
 
 def espeak_fallback_batch(texts: list[str], language: str = 'en-us') -> list[str]:
@@ -193,27 +214,45 @@ def phonemize_batch(texts: list[str], skip_normalize: bool = False, phoneme_dict
                     sw, sp = st.groups()
                     if sp: sent_tokens.append({'lang': 'punct', 'content': sp, 'phone': sp})
                     else:
-                        lw = sw.lower()
-                        if lw in custom: sent_tokens.append({'lang': 'en', 'content': sw, 'phone': custom[lw]})
-                        elif use_system and lw in phone_dict_common: sent_tokens.append({'lang': 'en', 'content': sw, 'phone': phone_dict_common[lw]})
-                        elif use_system and lw in phone_dict_merged and phone_dict_merged[lw].startswith('<en>'):
-                            sent_tokens.append({'lang': 'en', 'content': sw, 'phone': phone_dict_merged[lw]})
-                        else:
-                            sent_tokens.append({'lang': 'en', 'content': sw, 'phone': None})
-                            global_unknown.add(sw)
+                        sent_tokens.append({'lang': 'en', 'content': sw, 'phone': None})
             elif punct: sent_tokens.append({'lang': 'punct', 'content': punct, 'phone': punct})
             elif word:
-                lw = word.lower()
-                if lw in custom: sent_tokens.append({'lang': 'en', 'content': word, 'phone': custom[lw]})
-                elif use_system and lw in phone_dict_merged:
-                    val = phone_dict_merged[lw]
-                    sent_tokens.append({'lang': 'en' if val.startswith('<en>') else 'vi', 'content': word, 'phone': val})
-                elif use_system and lw in phone_dict_common:
-                    sent_tokens.append({'lang': 'common', 'content': word, 'phone': phone_dict_common[lw]})
-                else:
-                    sent_tokens.append({'lang': 'en', 'content': word, 'phone': None})
-                    global_unknown.add(word)
+                sent_tokens.append({'lang': 'unknown', 'content': word, 'phone': None})
         batch_token_lists.append(sent_tokens)
+
+    # Resolve all words from DB in one batch
+    all_words = set()
+    for sent in batch_token_lists:
+        for t in sent:
+            if t['lang'] != 'punct':
+                all_words.add(t['content'].lower())
+    
+    db_merged, db_common = phone_db.lookup_batch(list(all_words)) if use_system else ({}, {})
+    
+    # Fill tokens with data from DB or custom dict
+    for sent in batch_token_lists:
+        for t in sent:
+            if t['lang'] == 'punct': continue
+            lw = t['content'].lower()
+            
+            # Priority: 1. Custom dict
+            if lw in custom:
+                t['phone'] = custom[lw]
+                t['lang'] = 'en' # Custom is usually en fallback or specific overriden vi
+            # 2. Merged DB
+            elif lw in db_merged:
+                val = db_merged[lw]
+                t['phone'] = val
+                t['lang'] = 'en' if val.startswith('<en>') else 'vi'
+            # 3. Common DB
+            elif lw in db_common:
+                t['phone'] = db_common[lw]
+                t['lang'] = 'common'
+            # 4. Global Unknown
+            else:
+                global_unknown.add(t['content'])
+                t['lang'] = 'en' # Temporary placeholder for espeak fallback logic
+
 
     if global_unknown:
         u_words = sorted(list(global_unknown))
