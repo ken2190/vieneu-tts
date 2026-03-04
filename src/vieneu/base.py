@@ -197,6 +197,11 @@ class BaseVieneuTTS(ABC):
         import librosa
         wav, _ = librosa.load(ref_audio_path, sr=16000, mono=True)
         wav_tensor = torch.from_numpy(wav).float().unsqueeze(0).unsqueeze(0)  # [1, 1, T]
+
+        # Ensure device and dtype compatibility
+        if hasattr(self.codec, "device"):
+            wav_tensor = wav_tensor.to(self.codec.device)
+
         with torch.no_grad():
             ref_codes = self.codec.encode_code(audio_or_path=wav_tensor).squeeze(0).squeeze(0)
         return ref_codes

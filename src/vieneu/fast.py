@@ -138,14 +138,14 @@ class FastVieNeuTTS(BaseVieneuTTS):
                 recon = self.codec.decode_code(codes).cpu().numpy()
         return recon[0, 0, :]
 
-    def _format_prompt(self, ref_codes: Union[List[int], torch.Tensor, np.ndarray], ref_text: str, input_text: str) -> str:
+    def _format_prompt(self, ref_codes: Union[List[int], torch.Tensor, np.ndarray], ref_text: str, input_text: str, ref_phonemes: Optional[str] = None, input_phonemes: Optional[str] = None) -> str:
         if isinstance(ref_codes, (torch.Tensor, np.ndarray)):
             ref_codes_list = ref_codes.flatten().tolist()
         else:
             ref_codes_list = ref_codes
 
-        ref_text_phones = phonemize_with_dict(ref_text)
-        input_text_phones = phonemize_with_dict(input_text, skip_normalize=True)
+        ref_text_phones = ref_phonemes if ref_phonemes else phonemize_with_dict(ref_text)
+        input_text_phones = input_phonemes if input_phonemes else phonemize_with_dict(input_text, skip_normalize=True)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
         return (
             f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text_phones} {input_text_phones}"
@@ -186,13 +186,19 @@ class FastVieNeuTTS(BaseVieneuTTS):
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
+        # Pre-phonemize all for performance
+        ref_phonemes = self.get_ref_phonemes(ref_text)
+        chunk_phonemes = phonemize_batch(texts, skip_normalize=True)
+
         self.gen_config.temperature = temperature
         self.gen_config.top_k = top_k
 
         all_wavs = []
         for i in range(0, len(texts), max_batch_size):
             batch_texts = texts[i : i + max_batch_size]
-            prompts = [self._format_prompt(ref_codes, ref_text, text) for text in batch_texts]
+            batch_phonemes = chunk_phonemes[i : i + max_batch_size]
+            prompts = [self._format_prompt(ref_codes, ref_text, text, ref_phonemes=ref_phonemes, input_phonemes=ph)
+                      for text, ph in zip(batch_texts, batch_phonemes)]
             responses = self.backbone(prompts, gen_config=self.gen_config, do_preprocess=False)
             batch_codes = [response.text for response in responses]
             batch_wavs = [self._decode(codes) for codes in batch_codes]

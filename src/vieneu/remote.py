@@ -45,14 +45,14 @@ class RemoteVieNeuTTS(VieNeuTTS):
     def _load_backbone(self, backbone_repo, backbone_device, hf_token=None):
         pass
 
-    def _format_prompt(self, ref_codes: Union[List[int], torch.Tensor, np.ndarray], ref_text: str, input_text: str) -> str:
+    def _format_prompt(self, ref_codes: Union[List[int], torch.Tensor, np.ndarray], ref_text: str, input_text: str, ref_phonemes: Optional[str] = None, input_phonemes: Optional[str] = None) -> str:
         if isinstance(ref_codes, (torch.Tensor, np.ndarray)):
             ref_codes_list = ref_codes.flatten().tolist()
         else:
             ref_codes_list = ref_codes
 
-        ref_text_phones = phonemize_with_dict(ref_text)
-        input_text_phones = phonemize_with_dict(input_text, skip_normalize=True)
+        ref_text_phones = ref_phonemes if ref_phonemes else phonemize_with_dict(ref_text)
+        input_text_phones = input_phonemes if input_phonemes else phonemize_with_dict(input_text, skip_normalize=True)
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes_list])
         return (
             f"user: Convert the text to speech:<|TEXT_PROMPT_START|>{ref_text_phones} {input_text_phones}"
@@ -70,9 +70,8 @@ class RemoteVieNeuTTS(VieNeuTTS):
         if not chunks:
             return np.array([], dtype=np.float32)
 
-        all_wavs = []
-        for chunk in chunks:
-            prompt = self._format_prompt(ref_codes, ref_text, chunk)
+        if len(chunks) == 1:
+            prompt = self._format_prompt(ref_codes, ref_text, chunks[0])
             payload = {
                 "model": self.model_name,
                 "messages": [{"role": "user", "content": prompt}],
@@ -87,13 +86,17 @@ class RemoteVieNeuTTS(VieNeuTTS):
                 response.raise_for_status()
                 output_str = response.json()["choices"][0]["message"]["content"]
                 wav = self._decode(output_str)
-                all_wavs.append(wav)
+                return self._apply_watermark(wav)
             except Exception as e:
                 logger.error(f"Error during remote inference: {e}")
-                continue
+                return np.array([], dtype=np.float32)
 
-        final_wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
-        return self._apply_watermark(final_wav)
+        # For multiple chunks, use async for parallel processing
+        return asyncio.run(self.infer_async(
+            text, ref_codes=ref_codes, ref_text=ref_text,
+            max_chars=max_chars, silence_p=silence_p, crossfade_p=crossfade_p,
+            temperature=temperature, top_k=top_k, skip_normalize=True, apply_watermark=True
+        ))
 
     def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False) -> Generator[np.ndarray, None, None]:
 
@@ -235,6 +238,27 @@ class RemoteVieNeuTTS(VieNeuTTS):
             apply_watermark=apply_watermark
         ))
 
+    async def _infer_chunk_async(self, session, chunk, ref_codes, ref_text, temperature, top_k, ref_phonemes=None, chunk_phonemes=None):
+        prompt = self._format_prompt(ref_codes, ref_text, chunk, ref_phonemes=ref_phonemes, input_phonemes=chunk_phonemes)
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 2048,
+            "temperature": temperature,
+            "top_k": top_k,
+            "stop": ["<|SPEECH_GENERATION_END|>"],
+            "stream": False
+        }
+        try:
+            async with session.post(f"{self.api_base}/chat/completions", json=payload, timeout=60) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                output_str = data["choices"][0]["message"]["content"]
+                return self._decode(output_str)
+        except Exception as e:
+            logger.error(f"Error in async chunk: {e}")
+            return np.array([], dtype=np.float32)
+
     async def infer_batch_async(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, torch.Tensor]] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, concurrency_limit: int = 50, skip_normalize: bool = False, apply_watermark: bool = True) -> List[np.ndarray]:
         try:
             import aiohttp
@@ -246,17 +270,33 @@ class RemoteVieNeuTTS(VieNeuTTS):
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
+        # Pre-phonemize all for performance
+        ref_phonemes = self.get_ref_phonemes(ref_text)
+        all_phonemes = phonemize_batch(texts, skip_normalize=True)
+
         sem = asyncio.Semaphore(concurrency_limit)
         async with aiohttp.ClientSession() as session:
-            async def bounded_infer(text):
+            async def bounded_infer(text, ph):
                 async with sem:
-                    return await self.infer_async(
-                        text, ref_codes=ref_codes, ref_text=ref_text,
-                        max_chars=max_chars, silence_p=silence_p, crossfade_p=crossfade_p,
-                        temperature=temperature, top_k=top_k,
-                        session=session, skip_normalize=True, apply_watermark=apply_watermark
-                    )
-            tasks = [bounded_infer(text) for text in texts]
+                    # Split into chunks internally if needed
+                    chunks = split_text_into_chunks(text, max_chars=max_chars)
+                    if not chunks: return np.array([], dtype=np.float32)
+
+                    if len(chunks) == 1:
+                        wav = await self._infer_chunk_async(session, chunks[0], ref_codes, ref_text, temperature, top_k, ref_phonemes=ref_phonemes, chunk_phonemes=ph)
+                        if apply_watermark: wav = self._apply_watermark(wav)
+                        return wav
+
+                    # Re-phonemize chunks if splitting happened
+                    chunk_phonemes = phonemize_batch(chunks, skip_normalize=True)
+                    tasks = [self._infer_chunk_async(session, c, ref_codes, ref_text, temperature, top_k, ref_phonemes=ref_phonemes, chunk_phonemes=c_ph)
+                            for c, c_ph in zip(chunks, chunk_phonemes)]
+                    wavs = await asyncio.gather(*tasks)
+                    final_wav = join_audio_chunks(wavs, self.sample_rate, silence_p, crossfade_p)
+                    if apply_watermark: final_wav = self._apply_watermark(final_wav)
+                    return final_wav
+
+            tasks = [bounded_infer(text, ph) for text, ph in zip(texts, all_phonemes)]
             results = await asyncio.gather(*tasks)
 
         return results

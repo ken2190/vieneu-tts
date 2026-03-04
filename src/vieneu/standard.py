@@ -109,6 +109,12 @@ class VieNeuTTS(BaseVieneuTTS):
         else:
             from transformers import AutoTokenizer, AutoModelForCausalLM
             self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo, token=hf_token)
+
+            # Configure tokenizer for batching
+            self.tokenizer.padding_side = "left"
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
             self.backbone = AutoModelForCausalLM.from_pretrained(backbone_repo, token=hf_token).to(
                 torch.device(backbone_device)
             )
@@ -240,17 +246,49 @@ class VieNeuTTS(BaseVieneuTTS):
 
         all_wavs = []
         # If model is GGUF, we still process sequentially for now as llama-cpp-python batching for TTS is complex
-        # If model is Torch, we can leverage batch generation if supported by transformers and memory
-        for phonemes in chunk_phonemes:
-            if self._is_quantized_model:
+        if self._is_quantized_model:
+            for phonemes in chunk_phonemes:
                 output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k)
-            else:
+                wav = self._decode(output_str)
+                if apply_watermark:
+                    wav = self._apply_watermark(wav)
+                all_wavs.append(wav)
+        # If model is Torch, we can leverage true batch generation
+        else:
+            batch_prompt_ids = []
+            for phonemes in chunk_phonemes:
                 prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes)
-                output_str = self._infer_torch(prompt_ids, temperature, top_k)
-            wav = self._decode(output_str)
-            if apply_watermark:
-                wav = self._apply_watermark(wav)
-            all_wavs.append(wav)
+                batch_prompt_ids.append(torch.tensor(prompt_ids))
+
+            inputs = self.tokenizer.pad(
+                {"input_ids": batch_prompt_ids},
+                padding=True,
+                return_tensors="pt"
+            )
+            # Move all tensors to device
+            inputs = {k: v.to(self.backbone.device) for k, v in inputs.items()}
+
+            speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
+            with torch.no_grad():
+                output_tokens = self.backbone.generate(
+                    **inputs,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_k=top_k,
+                    use_cache=True,
+                    min_new_tokens=50,
+                )
+
+            input_length = inputs["input_ids"].shape[-1]
+            for i in range(len(texts)):
+                generated_ids = output_tokens[i, input_length:]
+                output_str = self.tokenizer.decode(generated_ids, add_special_tokens=False)
+                wav = self._decode(output_str)
+                if apply_watermark:
+                    wav = self._apply_watermark(wav)
+                all_wavs.append(wav)
 
         return all_wavs
 

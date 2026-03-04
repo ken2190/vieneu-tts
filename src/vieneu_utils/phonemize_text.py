@@ -39,16 +39,23 @@ class PhonemeDB:
         conn = self._get_conn()
         cursor = conn.cursor()
         
-        # Batch query for efficiency
-        placeholders = ','.join(['?'] * len(words))
+        merged_map = {}
+        common_map = {}
         
-        # Query merged table
-        cursor.execute(f"SELECT word, phone FROM merged WHERE word IN ({placeholders})", words)
-        merged_map = dict(cursor.fetchall())
-        
-        # Query common table
-        cursor.execute(f"SELECT word, vi_phone, en_phone FROM common WHERE word IN ({placeholders})", words)
-        common_map = {row[0]: {"vi": row[1], "en": row[2]} for row in cursor.fetchall()}
+        # SQLite has a limit on the number of host parameters (typically 999)
+        chunk_size = 950
+        for i in range(0, len(words), chunk_size):
+            chunk = words[i : i + chunk_size]
+            placeholders = ','.join(['?'] * len(chunk))
+
+            # Query merged table
+            cursor.execute(f"SELECT word, phone FROM merged WHERE word IN ({placeholders})", chunk)
+            merged_map.update(dict(cursor.fetchall()))
+
+            # Query common table
+            cursor.execute(f"SELECT word, vi_phone, en_phone FROM common WHERE word IN ({placeholders})", chunk)
+            for row in cursor.fetchall():
+                common_map[row[0]] = {"vi": row[1], "en": row[2]}
         
         return merged_map, common_map
 
