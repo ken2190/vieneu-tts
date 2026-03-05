@@ -34,7 +34,7 @@
                             500: '#14b8a6',
                             600: '#0f766e',
                         },
-                        violet: {
+                        amber: {
                             500: '#f59e0b',
                         }
                     },
@@ -819,16 +819,7 @@
         const API_URL = '';
 
         const TtsInterface = () => {
-            const [text, setText] = useState(`Sức Mạnh Của Sự Thích Nghi Trong Kỷ Nguyên Số
-Chúng ta đang sống trong một thời đại mà sự thay đổi không còn tính bằng thập kỷ, mà bằng từng ngày, thậm chí từng giờ. Cuộc cách mạng công nghiệp lần thứ tư đã xóa nhòa ranh giới giữa thế giới thực và thế giới ảo, đặt con người trước những cơ hội khổng lồ nhưng cũng không ít thách thức nghiệt ngã. Trong bối cảnh đó, kỹ năng quan trọng nhất để một cá nhân có thể tồn tại và phát triển không phải là kiến thức chuyên môn thuần túy, mà chính là khả năng thích nghi.
-
-Thích nghi không có nghĩa là đánh mất bản sắc hay buông xuôi theo dòng chảy của số phận. Ngược lại, đó là một quá trình chủ động học hỏi, điều chỉnh tư duy và hành động để phù hợp với hoàn cảnh mới. Hãy nhìn vào cách chúng ta giao tiếp: từ những lá thư tay mất hàng tuần để chuyển đi, giờ đây chỉ cần một cú chạm nhẹ trên màn hình điện thoại, thông tin đã có thể đi vòng quanh thế giới. Nếu một doanh nghiệp vẫn khăng khăng giữ phương thức quản lý truyền thống, từ chối chuyển đổi số, họ sẽ sớm bị đào thải. Tương tự, nếu một cá nhân ngừng cập nhật kỹ năng công nghệ, họ sẽ tự thấy mình trở nên lạc hậu trong chính môi trường làm việc của mình.
-
-Tuy nhiên, sự thích nghi thực sự nằm ở tư duy mở (growth mindset). Thay vì sợ hãi trước những trí tuệ nhân tạo hay robot hóa, người có khả năng thích nghi cao sẽ nhìn thấy ở đó những công cụ để giải phóng sức lao động và kích thích sự sáng tạo. Họ coi những khó khăn, biến động là những bài kiểm tra cho bản lĩnh của mình. Lịch sử nhân loại đã chứng minh rằng, giống loài tồn tại mạnh mẽ nhất không phải là giống loài khỏe nhất hay thông minh nhất, mà là giống loài có khả năng thích ứng tốt nhất với sự thay đổi của môi trường.
-
-Bên cạnh đó, trong thế giới số đầy biến động, việc giữ vững những giá trị cốt lõi như đạo đức và sự tử tế cũng là một phần của sự thích nghi thông minh. Công nghệ có thể thay đổi, nhưng nhu cầu về sự kết nối thực sự giữa người với người thì luôn hiện hữu. Chúng ta thích nghi với công cụ mới nhưng không được để mình trở thành nô lệ của chúng. Sự cân bằng giữa trí tuệ nhân tạo và trí tuệ cảm xúc chính là chìa khóa để con người không bị hòa tan trong dòng chảy cơ khí hóa.
-
-Tóm lại, thế giới ngày mai thuộc về những người sẵn sàng bước ra khỏi vùng an toàn. Đừng sợ hãi sự thay đổi, hãy chào đón nó như một phần tất yếu của cuộc sống. Khi chúng ta giữ cho mình một tâm thế sẵn sàng học lại từ đầu (re-learn), chúng ta sẽ thấy rằng mọi sự chuyển dịch đều mang trong mình những hạt mầm của sự tiến bộ. Hãy nhớ rằng, cánh cửa của tương lai chỉ mở ra cho những ai biết linh hoạt xoay chuyển theo nhịp đập của thời đại.`);
+            const [text, setText] = useState('');
             const [status, setStatus] = useState(StreamStatus.IDLE);
             const [metrics, setMetrics] = useState({ latencyMs: null, startTime: null });
             const [voices, setVoices] = useState([]);
@@ -1035,7 +1026,7 @@ Tóm lại, thế giới ngày mai thuộc về những người sẵn sàng bư
                         }
                     };
 
-                    processStream();
+                    await processStream();
 
                 } catch (e) {
                     if (e.name !== 'AbortError') {
@@ -1117,7 +1108,7 @@ Tóm lại, thế giới ngày mai thuộc về những người sẵn sàng bư
                 const url = URL.createObjectURL(audioBlob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `vienau_tts_${Date.now()}.wav`;
+                a.download = `vieneu_tts_${Date.now()}.wav`;
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
