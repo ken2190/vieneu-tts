@@ -49,20 +49,11 @@ VieNeu-TTS cung cấp khả năng tổng hợp giọng nói sẵn sàng cho môi
 ---
 
 ## 🦜 1. Cài đặt & Giao diện Web <a name="installation"></a>
-
-> [!IMPORTANT]
-> **Bắt buộc cài đặt eSpeak NG:** Bạn phải cài đặt eSpeak NG trước khi chạy VieNeu-TTS. [Xem hướng dẫn cài đặt eSpeak NG tại đây](#espeak).
-
 > **Cài đặt cho Intel Arc GPU (Tùy chọn):** Sử dụng PyTorch 2.11 hỗ trợ XPU. [Dành cho người dùng Intel Arc GPU, xem phần hướng dẫn bên dưới](#intel-arc). Đã thử nghiệm trên Arc B580 và A770 trên Windows.
 
 Cách nhanh nhất để trải nghiệm VieNeu-TTS là thông qua giao diện Web (Gradio).
 
 ### Yêu cầu hệ thống
-- **Python:** 3.12
-- <a id="espeak"></a>**eSpeak NG:** Cần thiết để xử lý âm vị.
-  - **Windows:** Tải file `.msi` từ [eSpeak NG Releases](https://github.com/espeak-ng/espeak-ng/releases).
-  - **macOS:** `brew install espeak`
-  - **Ubuntu/Debian:** `sudo apt install espeak-ng`
 - **NVIDIA GPU (Tùy chọn):** Để đạt tốc độ tối đa qua LMDeploy hoặc GGUF tăng tốc GPU.
   - Yêu cầu **NVIDIA Driver >= 570.65** (CUDA 12.8+) hoặc cao hơn.
   - Đối với **LMDeploy**, khuyến nghị cài đặt [NVIDIA GPU Computing Toolkit](https://developer.nvidia.com/cuda-downloads).
