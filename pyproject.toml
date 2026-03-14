@@ -90,6 +90,7 @@ dependencies = [
 [project.optional-dependencies]
 gpu = [
     "lmdeploy; sys_platform != 'darwin'",
+    "vllm; sys_platform != 'darwin'",
     "triton-windows; sys_platform == 'win32'",
     "triton; sys_platform == 'linux'",
     "transformers; sys_platform == 'darwin'",
@@ -104,6 +105,7 @@ dev = [
 
 web = [
     "lmdeploy; sys_platform != 'darwin'",
+    "vllm; sys_platform != 'darwin'",
     "triton-windows; sys_platform == 'win32'",
     "triton; sys_platform == 'linux'",
     "transformers; sys_platform == 'darwin'",
@@ -151,4 +153,8 @@ llama-cpp-python = [
     { index = "llama-cpp-win-cpu", marker = "sys_platform == 'win32'" },
     { index = "llama-cpp-metal", marker = "sys_platform == 'darwin'" },
     { index = "pypi", marker = "sys_platform != 'win32' and sys_platform != 'darwin'" }
+]
+
+vllm = [
+    { index = "pypi", marker = "sys_platform != 'darwin'" }
 ]
